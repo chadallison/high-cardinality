@@ -1,0 +1,256 @@
+---
+title: "how to handle high-cardinality predictors for data on museums in the UK"
+author: "chad allison"
+date: '2023-01-25'
+output: github_document
+---
+
+### setup
+
+```{r message = F, warning = F}
+tictoc::tic()
+library(tidyverse) # essential functions
+library(tidymodels) # modeling
+library(embed) # feature encoding
+library(skimr) # data skimming
+library(finetune) # model tuning
+library(vip) # variable importance
+theme_set(theme_minimal())
+update_geom_defaults("rect", list(fill = "springgreen4", alpha = 0.75))
+```
+
+### data import
+
+```{r}
+link = "https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2022/2022-11-22/museums.csv"
+museums = read_csv(link, col_types = cols())
+glimpse(museums)
+```
+
+### visualizing `Accrediation` counts (our outcome variable)
+
+```{r}
+museums |>
+  count(Accreditation) |>
+  ggplot(aes(Accreditation, n)) +
+  geom_col(aes(fill = Accreditation), alpha = 0.75) +
+  geom_text(aes(label = n), vjust = -0.5) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  labs(x = "accreditation status", y = "count",
+       title = "accreditation counts; not too much class imbalance") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+### closer look at top subject matters
+
+```{r}
+top_subjects = museums |>
+  count(Subject_Matter, sort = T) |>
+  slice_max(n, n = 6) |>
+  pull(Subject_Matter)
+
+museums |>
+  filter(Subject_Matter %in% top_subjects) |>
+  count(Subject_Matter, Accreditation) |>
+  ggplot(aes(Accreditation, n)) +
+  geom_col(aes(fill = Accreditation), show.legend = F, alpha = 0.75) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  facet_wrap(vars(Subject_Matter), scales = "free") +
+  labs(title = "accreditation counts among top six subjects") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### accreditation counts for different museum sizes
+
+```{r}
+museums |>
+  count(Accreditation, Size) |>
+  mutate(Size = factor(Size, levels = c("unknown", "small", "medium", "large", "huge"))) |>
+  ggplot(aes(Size, n)) +
+  geom_col(aes(fill = Accreditation), position = "dodge", alpha = 0.75) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  annotate("text", x = 4.5, y = 1375, size = 3.5, fontface = "italic",
+           label = "note that some of the musuem\nsize variables are imputed") +
+  labs(x = "museum size", y = "count", fill = NULL,
+       title = "accreditation status by museum size") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### governance status and accreditation counts
+
+```{r}
+top_gov = museums |>
+  count(Governance, sort = T) |>
+  slice_max(n, n = 4) |>
+  pull(Governance)
+
+museums |>
+  filter(Governance %in% top_gov) |>
+  count(Governance, Accreditation) |>
+  ggplot(aes(Accreditation, n)) +
+  geom_col(aes(fill = Accreditation), show.legend = F, alpha = 0.75) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  facet_wrap(vars(Governance), scales = "free_y") +
+  labs(x = "accreditation status", y = "count",
+       title = "accreditation counts among top governance statuses") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### getting data for modeling
+
+```{r}
+museums_parsed = museums |>
+  select(museum_id, Accreditation, Governance, Size, Subject_Matter,
+         Year_opened, Year_closed, Area_Deprivation_index) |>
+  mutate(Year_opened = parse_number(Year_opened),
+         Closed = ifelse(Year_closed == "9999:9999", "Open", "Closed")) |>
+  select(-Year_closed) |>
+  na.omit() |>
+  mutate_if(is.character, as.factor) |>
+  mutate(museum_id = as.character(museum_id))
+
+glimpse(museums_parsed)
+```
+
+### data splitting and cross validation
+
+```{r}
+set.seed(123)
+museum_split = initial_split(museums_parsed, prop = 0.75, strata = Accreditation)
+museum_train = training(museum_split)
+museum_test = testing(museum_split)
+
+set.seed(234)
+museum_folds = vfold_cv(museum_train, strata = Accreditation)
+museum_folds
+```
+
+### creating recipe while handling high-cardinality
+
+```{r}
+museum_rec = recipe(Accreditation ~ ., data = museum_train) |>
+  update_role(museum_id, new_role = "id") |>
+  step_lencode_glm(Subject_Matter, outcome = vars(Accreditation)) |> # embed
+  step_dummy(all_nominal_predictors())
+
+prep(museum_rec) |>
+  bake(new_data = NULL) |>
+  skim()
+```
+
+### looking at the effects of the subject matter encodings
+
+```{r}
+prep(museum_rec) |>
+  tidy(number = 1) |>
+  filter(level == "..new") |>
+  mutate(value = round(value, 3))
+```
+
+### creating model specification
+
+```{r}
+xgb_spec = boost_tree(trees = tune(), min_n = tune(), mtry = tune(), learn_rate = 0.01) |>
+  set_engine("xgboost") |>
+  set_mode("classification")
+
+xgb_spec
+```
+
+### creating workflow
+
+```{r}
+xgb_wf = workflow(museum_rec, xgb_spec)
+xgb_wf
+```
+
+### tuning
+
+```{r}
+doParallel::registerDoParallel()
+set.seed(345)
+xgb_rs = tune_race_anova(xgb_wf,
+                resamples = museum_folds,
+                grid = 15,
+                control = control_race(verbose_elim = T))
+
+xgb_rs
+```
+
+### plotting tuning results
+
+```{r}
+plot_race(xgb_rs) +
+  labs(x = "analysis stage", title = "racing results") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### modeling metrics
+
+```{r}
+collect_metrics(xgb_rs)
+```
+
+### fitting model on all training data, evaluating on testing data
+
+```{r}
+xgb_last = xgb_wf |>
+  finalize_workflow(select_best(xgb_rs, "accuracy")) |>
+  last_fit(museum_split)
+
+xgb_last |>
+  collect_metrics()
+```
+
+### confusion matrix
+
+```{r}
+collect_predictions(xgb_last) |>
+  conf_mat(Accreditation, .pred_class) |>
+  autoplot(type = "heatmap")
+```
+
+### variable importance
+
+```{r}
+xgb_last |>
+  extract_fit_engine() |>
+  vip() +
+  annotate("text", x = 5, y = 0.15, size = 3.5, fontface = "italic",
+           label = "note that subject matter is important;\nfeature encoding enabled this")
+```
+
+### visualizing original data given variable importance
+
+```{r}
+museums |>
+  mutate(closed = ifelse(Year_closed == "9999:9999", "open", "closed")) |>
+  count(Accreditation, closed) |>
+  ggplot(aes(closed, n)) +
+  geom_col(aes(fill = Accreditation), position = "dodge") +
+  geom_text(aes(label = n), vjust = -0.5, position = position_dodge2(width = 0.9), size = 3.5) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  labs(x = "museum open or closed", y = "count", fill = NULL,
+       title = "accreditation status by museum open/closed status") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+### script runtime
+
+```{r}
+tictoc::toc()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
